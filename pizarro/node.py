@@ -5,9 +5,10 @@ import json
 from dataclasses import dataclass, field
 from typing import Any
 
-from .core import Block, Chain, Transaction
+from .core import Block, BlockHeader, Chain, Transaction
 
 MAX_MESSAGE_BYTES = 1 << 20
+MAX_BLOCKS_PER_RESPONSE = 256
 
 
 def encode_message(message: dict[str, Any]) -> bytes:
@@ -15,6 +16,44 @@ def encode_message(message: dict[str, Any]) -> bytes:
     if len(payload) > MAX_MESSAGE_BYTES:
         raise ValueError("message too large")
     return payload + b"\n"
+
+
+def transaction_to_dict(tx: Transaction) -> dict[str, Any]:
+    return tx.to_dict()
+
+
+def transaction_from_dict(data: dict[str, Any]) -> Transaction:
+    tx = Transaction(
+        sender=str(data["sender"]),
+        recipient=str(data["recipient"]),
+        amount=int(data["amount"]),
+        nonce=int(data["nonce"]),
+        chain_id=str(data.get("chain_id", "")),
+    )
+    tx.validate()
+    return tx
+
+
+def block_to_dict(block: Block) -> dict[str, Any]:
+    return {
+        "header": block.header.to_dict(),
+        "transactions": [transaction_to_dict(tx) for tx in block.transactions],
+    }
+
+
+def block_from_dict(data: dict[str, Any]) -> Block:
+    header_data = data["header"]
+    header = BlockHeader(
+        height=int(header_data["height"]),
+        previous_hash=str(header_data["previous_hash"]),
+        merkle_root=str(header_data["merkle_root"]),
+        timestamp=int(header_data["timestamp"]),
+        difficulty=int(header_data["difficulty"]),
+        nonce=int(header_data["nonce"]),
+        chain_id=str(header_data.get("chain_id", "")),
+    )
+    txs = tuple(transaction_from_dict(tx) for tx in data.get("transactions", []))
+    return Block(header, txs)
 
 
 @dataclass
@@ -56,22 +95,57 @@ class DevNode:
             if not raw or len(raw) > MAX_MESSAGE_BYTES:
                 return
             msg = json.loads(raw)
+            if not isinstance(msg, dict):
+                return
             await self.handle_message(msg, writer)
-        except (ValueError, json.JSONDecodeError, UnicodeDecodeError):
-            return
+        except (ValueError, KeyError, TypeError, json.JSONDecodeError, UnicodeDecodeError):
+            try:
+                writer.write(encode_message({"type": "error", "error": "invalid_message"}))
+                await writer.drain()
+            except (ConnectionError, ValueError):
+                pass
         finally:
             writer.close()
             await writer.wait_closed()
 
+    async def _send(self, writer: asyncio.StreamWriter, message: dict[str, Any]) -> None:
+        writer.write(encode_message(message))
+        await writer.drain()
+
+    def _canonical_chain(self) -> list[Block]:
+        """Return the selected tip's ancestors in genesis-to-tip order."""
+        blocks: list[Block] = []
+        current = self.chain.tip
+        while current.header.height > 0:
+            blocks.append(current)
+            current = self.chain.blocks[current.header.previous_hash]
+        blocks.append(current)
+        blocks.reverse()
+        return blocks
+
     async def handle_message(self, msg: dict[str, Any], writer: asyncio.StreamWriter) -> None:
         kind = msg.get("type")
         if kind == "ping":
-            writer.write(encode_message({"type": "pong"}))
-            await writer.drain()
+            await self._send(writer, {"type": "pong"})
         elif kind == "status":
             tip = self.chain.tip
-            writer.write(encode_message({"type": "status", "height": tip.header.height, "work": self.chain.work[tip.header.hash]}))
-            await writer.drain()
+            await self._send(
+                writer,
+                {"type": "status", "height": tip.header.height, "work": self.chain.work[tip.header.hash]},
+            )
+        elif kind == "getblocks":
+            start_height = max(0, int(msg.get("from_height", 0)))
+            blocks = [b for b in self._canonical_chain() if b.header.height >= start_height]
+            blocks = blocks[:MAX_BLOCKS_PER_RESPONSE]
+            await self._send(writer, {"type": "blocks", "blocks": [block_to_dict(b) for b in blocks]})
+        elif kind == "block":
+            block = block_from_dict(msg["block"])
+            self.chain.add_block(block)
+            await self._send(writer, {"type": "accepted", "hash": block.header.hash})
+        elif kind == "blocks":
+            for data in msg.get("blocks", []):
+                self.chain.add_block(block_from_dict(data))
+            await self._send(writer, {"type": "accepted", "height": self.chain.tip.header.height})
         else:
             raise ValueError("unsupported message")
 
@@ -82,6 +156,41 @@ class DevNode:
             await writer.drain()
             raw = await reader.readline()
             return json.loads(raw).get("type") == "pong"
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+    async def sync_from(self, host: str, port: int) -> int:
+        """Fetch and validate the remote canonical chain from our current height."""
+        reader, writer = await asyncio.open_connection(host, port, limit=MAX_MESSAGE_BYTES)
+        try:
+            start = self.chain.tip.header.height + 1
+            writer.write(encode_message({"type": "getblocks", "from_height": start}))
+            await writer.drain()
+            raw = await reader.readline()
+            response = json.loads(raw)
+            if response.get("type") != "blocks":
+                raise ValueError("peer did not return blocks")
+            accepted = 0
+            for data in response.get("blocks", []):
+                block = block_from_dict(data)
+                before = len(self.chain.blocks)
+                self.chain.add_block(block)
+                accepted += len(self.chain.blocks) - before
+            return accepted
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+    async def send_block(self, host: str, port: int, block: Block) -> bool:
+        """Send one block; the peer must validate it against its local chain."""
+        block.validate(self.chain.blocks.get(block.header.previous_hash))
+        reader, writer = await asyncio.open_connection(host, port, limit=MAX_MESSAGE_BYTES)
+        try:
+            writer.write(encode_message({"type": "block", "block": block_to_dict(block)}))
+            await writer.drain()
+            raw = await reader.readline()
+            return json.loads(raw).get("type") == "accepted"
         finally:
             writer.close()
             await writer.wait_closed()
