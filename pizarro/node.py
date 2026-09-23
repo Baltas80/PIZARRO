@@ -42,7 +42,11 @@ def block_to_dict(block: Block) -> dict[str, Any]:
 
 
 def block_from_dict(data: dict[str, Any]) -> Block:
+    if not isinstance(data, dict):
+        raise ValueError("invalid block payload")
     header_data = data["header"]
+    if not isinstance(header_data, dict):
+        raise ValueError("invalid block header")
     header = BlockHeader(
         height=int(header_data["height"]),
         previous_hash=str(header_data["previous_hash"]),
@@ -52,7 +56,12 @@ def block_from_dict(data: dict[str, Any]) -> Block:
         nonce=int(header_data["nonce"]),
         chain_id=str(header_data.get("chain_id", "")),
     )
-    txs = tuple(transaction_from_dict(tx) for tx in data.get("transactions", []))
+    raw_txs = data.get("transactions", [])
+    if not isinstance(raw_txs, list):
+        raise ValueError("invalid transactions payload")
+    if len(raw_txs) > 10_000:
+        raise ValueError("too many transactions")
+    txs = tuple(transaction_from_dict(tx) for tx in raw_txs)
     return Block(header, txs)
 
 
@@ -96,9 +105,10 @@ class DevNode:
                 return
             msg = json.loads(raw)
             if not isinstance(msg, dict):
-                return
+                raise ValueError("invalid message")
             await self.handle_message(msg, writer)
-        except (ValueError, KeyError, TypeError, json.JSONDecodeError, UnicodeDecodeError):
+        except (ValueError, KeyError, TypeError, json.JSONDecodeError, UnicodeDecodeError,
+                asyncio.LimitOverrunError, asyncio.IncompleteReadError):
             try:
                 writer.write(encode_message({"type": "error", "error": "invalid_message"}))
                 await writer.drain()
@@ -143,7 +153,10 @@ class DevNode:
             self.chain.add_block(block)
             await self._send(writer, {"type": "accepted", "hash": block.header.hash})
         elif kind == "blocks":
-            for data in msg.get("blocks", []):
+            raw_blocks = msg.get("blocks", [])
+            if not isinstance(raw_blocks, list) or len(raw_blocks) > MAX_BLOCKS_PER_RESPONSE:
+                raise ValueError("too many blocks")
+            for data in raw_blocks:
                 self.chain.add_block(block_from_dict(data))
             await self._send(writer, {"type": "accepted", "height": self.chain.tip.header.height})
         else:
@@ -171,8 +184,11 @@ class DevNode:
             response = json.loads(raw)
             if response.get("type") != "blocks":
                 raise ValueError("peer did not return blocks")
+            remote_blocks = response.get("blocks", [])
+            if not isinstance(remote_blocks, list) or len(remote_blocks) > MAX_BLOCKS_PER_RESPONSE:
+                raise ValueError("too many blocks")
             accepted = 0
-            for data in response.get("blocks", []):
+            for data in remote_blocks:
                 block = block_from_dict(data)
                 before = len(self.chain.blocks)
                 self.chain.add_block(block)
@@ -183,8 +199,11 @@ class DevNode:
             await writer.wait_closed()
 
     async def send_block(self, host: str, port: int, block: Block) -> bool:
-        """Send one block; the peer must validate it against its local chain."""
-        block.validate(self.chain.blocks.get(block.header.previous_hash))
+        """Send one block; require its parent to exist locally before transmitting."""
+        parent = self.chain.blocks.get(block.header.previous_hash)
+        if parent is None:
+            raise ValueError("unknown parent")
+        block.validate(parent)
         reader, writer = await asyncio.open_connection(host, port, limit=MAX_MESSAGE_BYTES)
         try:
             writer.write(encode_message({"type": "block", "block": block_to_dict(block)}))
